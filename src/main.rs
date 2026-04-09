@@ -238,7 +238,18 @@ fn main() -> ! {
 
                 display.flush().unwrap();
 
-                delay.delay_millis(2000);
+                // czekamy 2 sekundy ale sprawdzamy przycisk co 50ms
+                for _ in 0..40 {
+                    delay.delay_millis(50);
+                    if btn.is_low() {
+                        // czekamy na zwolnienie przycisku i przelaczamy
+                        while btn.is_low() {
+                            delay.delay_millis(10);
+                        }
+                        screen = Screen::Sort;
+                        break;
+                    }
+                }
 
                 // aktualizacja zegara
                 seconds += 2;
