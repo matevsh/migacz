@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:botland.com.pl)",
+      "WebFetch(domain:docs.rs)"
+    ]
+  }
+}
