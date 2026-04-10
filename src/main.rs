@@ -106,7 +106,7 @@ fn lcg_next(seed: &mut u32) -> u32 {
 fn gen_array(seed: &mut u32) -> [u8; NUM_BARS] {
     let mut arr = [0u8; NUM_BARS];
     for i in 0..NUM_BARS {
-        arr[i] = (lcg_next(seed) % 120 + 1) as u8;
+        arr[i] = (lcg_next(seed) % BAR_MAX_H as u32 + 1) as u8;
     }
     arr
 }
@@ -115,7 +115,7 @@ const NUM_BARS: usize = 20;
 const BAR_WIDTH: usize = 10;
 const BAR_GAP: usize = 2;
 const BAR_BOTTOM: i32 = 134;
-const BAR_MAX_H: i32 = 120;
+const BAR_MAX_H: i32 = 95;
 const BAR_TOP: i32 = BAR_BOTTOM - BAR_MAX_H; // 14
 
 fn value_color(val: u8) -> Rgb565 {
@@ -342,7 +342,7 @@ fn main() -> ! {
 
                 // rysujemy tytul + wszystkie slupki raz
                 display.clear(Rgb565::BLACK).ok();
-                font.render_aligned(
+                font_big.render_aligned(
                     "Quick Sort",
                     Point::new(2, 2),
                     u8g2_fonts::types::VerticalPosition::Top,
