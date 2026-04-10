@@ -1,18 +1,28 @@
 #![no_std]
 #![no_main]
 
-use esp_backtrace as _;
-use esp_hal::{delay::Delay, gpio::{Io, Input, Level, Output, OutputOpenDrain, Pull}, prelude::*};
-use esp_hal::i2c::I2c;
-use sh1106::{prelude::*, Builder};
+use core::fmt::Write;
+use dht_sensor::{dht11, DhtReading};
+use display_interface_spi::SPIInterface;
 use embedded_graphics::{
-    pixelcolor::BinaryColor,
+    pixelcolor::Rgb565,
+    prelude::*,
+    primitives::{PrimitiveStyle, Rectangle},
+};
+use embedded_hal_bus::spi::ExclusiveDevice;
+use esp_backtrace as _;
+use esp_hal::spi::master::Spi;
+use esp_hal::spi::SpiMode;
+use esp_hal::{
+    delay::Delay,
+    gpio::{Input, Io, Level, Output, OutputOpenDrain, Pull},
     prelude::*,
 };
-use u8g2_fonts::{fonts, FontRenderer};
-use dht_sensor::{dht11, DhtReading};
-use core::fmt::Write;
 use heapless::String;
+use mipidsi::models::ST7789;
+use mipidsi::options::{ColorInversion, Orientation, Rotation};
+use mipidsi::Builder as DisplayBuilder;
+use u8g2_fonts::{fonts, FontRenderer};
 
 // aktywny widok
 enum Screen {
@@ -68,15 +78,19 @@ const CLOCK: [u16; 12] = [
     0b0000000000000000,
 ];
 
-// rysuje ikonke 12x12 na podanej pozycji
-fn draw_icon<DI>(display: &mut GraphicsMode<DI>, icon: &[u16; 12], x_off: u32, y_off: u32)
+// rysuje ikonke 12x12 na podanej pozycji (biala na czarnym tle)
+fn draw_icon<D>(display: &mut D, icon: &[u16; 12], x_off: i32, y_off: i32)
 where
-    DI: sh1106::interface::DisplayInterface,
+    D: DrawTarget<Color = Rgb565>,
 {
     for (y, row) in icon.iter().enumerate() {
         for x in 0..12 {
             if row & (1 << (15 - x)) != 0 {
-                display.set_pixel(x_off + x as u32, y_off + y as u32, 1);
+                let _ = Pixel(
+                    Point::new(x_off + x as i32, y_off + y as i32),
+                    Rgb565::WHITE,
+                )
+                .draw(display);
             }
         }
     }
@@ -88,38 +102,71 @@ fn lcg_next(seed: &mut u32) -> u32 {
     *seed
 }
 
-// generuje tablice 64 pseudolosowych wartosci od 1 do 51
-fn gen_array(seed: &mut u32) -> [u8; 64] {
-    let mut arr = [0u8; 64];
-    for i in 0..64 {
-        arr[i] = (lcg_next(seed) % 51 + 1) as u8;
+// generuje tablice pseudolosowych wartosci od 1 do 120
+fn gen_array(seed: &mut u32) -> [u8; NUM_BARS] {
+    let mut arr = [0u8; NUM_BARS];
+    for i in 0..NUM_BARS {
+        arr[i] = (lcg_next(seed) % 120 + 1) as u8;
     }
     arr
 }
 
-// rysuje slupki — active_a i active_b to indeksy aktualnie porownywanych elementow (rysowane inaczej)
-fn draw_bars<DI>(display: &mut GraphicsMode<DI>, arr: &[u8; 64], active_a: usize, active_b: usize)
-where
-    DI: sh1106::interface::DisplayInterface,
-{
-    for i in 0..64 {
-        let x = (i * 2) as u32;
-        let h = arr[i] as u32;
-        let is_active = i == active_a || i == active_b;
+const NUM_BARS: usize = 20;
+const BAR_WIDTH: usize = 10;
+const BAR_GAP: usize = 2;
+const BAR_BOTTOM: i32 = 134;
+const BAR_MAX_H: i32 = 120;
+const BAR_TOP: i32 = BAR_BOTTOM - BAR_MAX_H; // 14
 
-        for y in 0..h {
-            let py = 63 - y;
-            if is_active {
-                // aktywne slupki rysujemy tylko jako krawedzie (pusty srodek)
-                if y == 0 || y == h - 1 || x == 0 || x == 1 {
-                    display.set_pixel(x, py, 1);
-                    display.set_pixel(x + 1, py, 1);
-                }
-            } else {
-                display.set_pixel(x, py, 1);
-                display.set_pixel(x + 1, py, 1);
-            }
-        }
+fn value_color(val: u8) -> Rgb565 {
+    let v = val.saturating_sub(1);
+    match v {
+        0..=23 => Rgb565::new(31, (v as u16 * 63 / 23) as u8, 0),
+        24..=47 => Rgb565::new((31 - (v - 24) as u16 * 31 / 23) as u8, 63, 0),
+        48..=71 => Rgb565::new(0, 63, ((v - 48) as u16 * 31 / 23) as u8),
+        72..=95 => Rgb565::new(0, (63 - (v - 72) as u16 * 63 / 23) as u8, 31),
+        _ => Rgb565::new(((v - 96) as u16 * 31 / 23) as u8, 0, 31),
+    }
+}
+
+// rysuje JEDEN slupek — czysci slot + rysuje kolorowy prostokat
+fn draw_bar<D>(display: &mut D, arr: &[u8; NUM_BARS], index: usize, active: bool)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let x = (index * (BAR_WIDTH + BAR_GAP)) as i32;
+    let h = arr[index] as i32;
+
+    // czyscimy slot (czarny)
+    let _ = Rectangle::new(
+        Point::new(x, BAR_TOP),
+        Size::new(BAR_WIDTH as u32, BAR_MAX_H as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+    .draw(display);
+
+    // rysujemy slupek
+    let color = if active {
+        Rgb565::WHITE
+    } else {
+        value_color(arr[index])
+    };
+
+    let _ = Rectangle::new(
+        Point::new(x, BAR_BOTTOM - h),
+        Size::new(BAR_WIDTH as u32, h as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(color))
+    .draw(display);
+}
+
+// rysuje wszystkie slupki (uzyj na poczatku i na koncu sortowania)
+fn draw_all_bars<D>(display: &mut D, arr: &[u8; NUM_BARS])
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    for i in 0..NUM_BARS {
+        draw_bar(display, arr, i, false);
     }
 }
 
@@ -129,12 +176,36 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
-    let i2c = I2c::new(peripherals.I2C0, io.pins.gpio4, io.pins.gpio5, 400.kHz());
 
-    // wyswietlacz SH1106 po I2C
-    let mut display: GraphicsMode<_> = Builder::new().connect_i2c(i2c).into();
-    display.init().unwrap();
-    display.clear();
+    // SPI do wyswietlacza LCD
+    let sclk = io.pins.gpio4;
+    let mosi = io.pins.gpio5;
+    let spi = Spi::new(peripherals.SPI2, 40.MHz(), SpiMode::Mode0)
+        .with_sck(sclk)
+        .with_mosi(mosi);
+
+    let cs = Output::new(io.pins.gpio7, Level::High);
+    let dc = Output::new(io.pins.gpio3, Level::Low);
+    let mut rst = Output::new(io.pins.gpio8, Level::High);
+
+    // podswietlenie wlaczone
+    let _bl = Output::new(io.pins.gpio10, Level::High);
+
+    // SPI -> SpiDevice (ExclusiveDevice dodaje obsluge CS)
+    let spi_dev = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
+    let spi_iface = SPIInterface::new(spi_dev, dc);
+
+    let mut delay = Delay::new();
+
+    // inicjalizacja wyswietlacza ST7789 240x135
+    let mut display = DisplayBuilder::new(ST7789, spi_iface)
+        .display_size(135, 240)
+        .display_offset(52, 40)
+        .orientation(Orientation::new().rotate(Rotation::Deg90))
+        .invert_colors(ColorInversion::Inverted)
+        .reset_pin(rst)
+        .init(&mut delay)
+        .unwrap();
 
     // LED na GPIO0
     let mut led = Output::new(io.pins.gpio0, Level::Low);
@@ -144,10 +215,11 @@ fn main() -> ! {
 
     // pin DHT11 jako open-drain na GPIO6
     let mut dht_pin = OutputOpenDrain::new(io.pins.gpio6, Level::High, Pull::Up);
-    let mut delay = Delay::new();
 
-    // font z polskimi znakami
+    // font maly (tytuly, etykiety)
     let font = FontRenderer::new::<fonts::u8g2_font_unifont_t_polish>();
+    // font duzy (wartosci pogodowe)
+    let font_big = FontRenderer::new::<fonts::u8g2_font_logisoso28_tr>();
 
     // zegar startowy - ustaw swoja godzine
     let mut hours: u8 = 14;
@@ -160,24 +232,9 @@ fn main() -> ! {
     // aktywny widok
     let mut screen = Screen::Weather;
 
-    // poprzedni stan przycisku — do detekcji zbocza (unikamy wielokrotnego przelaczenia)
-    let mut btn_prev_low = false;
-
     esp_println::logger::init_logger_from_env();
 
     loop {
-        // sprawdzenie przycisku — przelaczamy widok przy wcisnięciu (zbocze opadajace)
-        let btn_now_low = btn.is_low();
-        log::info!("przycisk: {}", btn_now_low);
-        if btn_now_low && !btn_prev_low {
-            log::info!("PRZELACZAM WIDOK");
-            screen = match screen {
-                Screen::Weather => Screen::Sort,
-                Screen::Sort => Screen::Weather,
-            };
-        }
-        btn_prev_low = btn_now_low;
-
         match screen {
             Screen::Weather => {
                 // odczyt temperatury i wilgotnosci z DHT11
@@ -204,39 +261,46 @@ fn main() -> ! {
                 let mut time_str: String<16> = String::new();
                 let _ = write!(time_str, "{:02}:{:02}", hours, minutes);
 
-                display.clear();
+                display.clear(Rgb565::BLACK).ok();
 
-                draw_icon(&mut display, &THERMOMETER, 2, 2);
-                font.render_aligned(
-                    temp_str.as_str(),
-                    Point::new(16, 2),
-                    u8g2_fonts::types::VerticalPosition::Top,
-                    u8g2_fonts::types::HorizontalAlignment::Left,
-                    u8g2_fonts::types::FontColor::Transparent(BinaryColor::On),
-                    &mut display,
-                ).ok();
+                // temperatura — ikonka + duzy tekst
+                draw_icon(&mut display, &THERMOMETER, 6, 10);
+                font_big
+                    .render_aligned(
+                        temp_str.as_str(),
+                        Point::new(24, 4),
+                        u8g2_fonts::types::VerticalPosition::Top,
+                        u8g2_fonts::types::HorizontalAlignment::Left,
+                        u8g2_fonts::types::FontColor::Transparent(Rgb565::new(31, 0, 0)),
+                        &mut display,
+                    )
+                    .ok();
 
-                draw_icon(&mut display, &DROP, 66, 2);
-                font.render_aligned(
-                    hum_str.as_str(),
-                    Point::new(80, 2),
-                    u8g2_fonts::types::VerticalPosition::Top,
-                    u8g2_fonts::types::HorizontalAlignment::Left,
-                    u8g2_fonts::types::FontColor::Transparent(BinaryColor::On),
-                    &mut display,
-                ).ok();
+                // wilgotnosc — ikonka + duzy tekst
+                draw_icon(&mut display, &DROP, 130, 10);
+                font_big
+                    .render_aligned(
+                        hum_str.as_str(),
+                        Point::new(148, 4),
+                        u8g2_fonts::types::VerticalPosition::Top,
+                        u8g2_fonts::types::HorizontalAlignment::Left,
+                        u8g2_fonts::types::FontColor::Transparent(Rgb565::new(0, 32, 31)),
+                        &mut display,
+                    )
+                    .ok();
 
-                draw_icon(&mut display, &CLOCK, 2, 28);
-                font.render_aligned(
-                    time_str.as_str(),
-                    Point::new(16, 28),
-                    u8g2_fonts::types::VerticalPosition::Top,
-                    u8g2_fonts::types::HorizontalAlignment::Left,
-                    u8g2_fonts::types::FontColor::Transparent(BinaryColor::On),
-                    &mut display,
-                ).ok();
-
-                display.flush().unwrap();
+                // zegar — ikonka + duzy tekst, wycentrowany na dole
+                draw_icon(&mut display, &CLOCK, 50, 75);
+                font_big
+                    .render_aligned(
+                        time_str.as_str(),
+                        Point::new(68, 68),
+                        u8g2_fonts::types::VerticalPosition::Top,
+                        u8g2_fonts::types::HorizontalAlignment::Left,
+                        u8g2_fonts::types::FontColor::Transparent(Rgb565::WHITE),
+                        &mut display,
+                    )
+                    .ok();
 
                 // czekamy 2 sekundy ale sprawdzamy przycisk co 50ms
                 for _ in 0..40 {
@@ -276,10 +340,23 @@ fn main() -> ! {
                 let mut arr = gen_array(&mut rng_seed);
                 let mut interrupted = false;
 
+                // rysujemy tytul + wszystkie slupki raz
+                display.clear(Rgb565::BLACK).ok();
+                font.render_aligned(
+                    "Quick Sort",
+                    Point::new(2, 2),
+                    u8g2_fonts::types::VerticalPosition::Top,
+                    u8g2_fonts::types::HorizontalAlignment::Left,
+                    u8g2_fonts::types::FontColor::Transparent(Rgb565::WHITE),
+                    &mut display,
+                )
+                .ok();
+                draw_all_bars(&mut display, &arr);
+
                 // quicksort iteracyjny ze stosem o stalym rozmiarze
-                let mut stack = [(0usize, 0usize); 64];
+                let mut stack = [(0usize, 0usize); NUM_BARS];
                 let mut stack_top: usize = 0;
-                stack[stack_top] = (0, 63);
+                stack[stack_top] = (0, NUM_BARS - 1);
                 stack_top += 1;
 
                 'sort: while stack_top > 0 {
@@ -297,75 +374,92 @@ fn main() -> ! {
                     for j in lo..hi {
                         // sprawdz przycisk — jesli wcisniety, przerwij sortowanie
                         if btn.is_low() {
-                            screen = Screen::Weather;
                             interrupted = true;
                             break 'sort;
                         }
 
                         if (arr[j] as usize) <= pivot {
-                            // zamiana arr[i] i arr[j]
-                            arr.swap(i, j);
+                            if i != j {
+                                // faza 1: highlight zrodla (j) przy starej wysokosci
+                                draw_bar(&mut display, &arr, j, true);
+                                delay.delay_millis(100);
 
-                            // przerysuj ekran po zamianie
-                            display.clear();
-                            font.render_aligned(
-                                "Quick Sort",
-                                Point::new(0, 0),
-                                u8g2_fonts::types::VerticalPosition::Top,
-                                u8g2_fonts::types::HorizontalAlignment::Left,
-                                u8g2_fonts::types::FontColor::Transparent(BinaryColor::On),
-                                &mut display,
-                            ).ok();
-                            draw_bars(&mut display, &arr, i, j);
-                            display.flush().unwrap();
+                                // swap
+                                arr.swap(i, j);
 
-                            delay.delay_millis(30);
+                                // faza 2: j cyan (nowa wys.), i highlight (nowa wys.)
+                                draw_bar(&mut display, &arr, j, false);
+                                draw_bar(&mut display, &arr, i, true);
+                                delay.delay_millis(100);
+
+                                // faza 3: i wraca do cyan
+                                draw_bar(&mut display, &arr, i, false);
+                            }
+                            // i == j: self-swap jest no-op, pomijamy
+
                             i += 1;
                         }
                     }
 
                     // ostatnia zamiana — pivot na swoje miejsce
-                    arr.swap(i, hi);
+                    if i != hi {
+                        // faza 1: highlight pivota (hi) przy starej wysokosci
+                        draw_bar(&mut display, &arr, hi, true);
+                        delay.delay_millis(50);
 
-                    display.clear();
-                    font.render_aligned(
-                        "Quick Sort",
-                        Point::new(0, 0),
-                        u8g2_fonts::types::VerticalPosition::Top,
-                        u8g2_fonts::types::HorizontalAlignment::Left,
-                        u8g2_fonts::types::FontColor::Transparent(BinaryColor::On),
-                        &mut display,
-                    ).ok();
-                    draw_bars(&mut display, &arr, i, i);
-                    display.flush().unwrap();
+                        // swap
+                        arr.swap(i, hi);
 
-                    delay.delay_millis(30);
+                        // faza 2: hi cyan (nowa wys.), i highlight (nowa wys.)
+                        draw_bar(&mut display, &arr, hi, false);
+                        draw_bar(&mut display, &arr, i, true);
+                        delay.delay_millis(50);
+
+                        // faza 3: i wraca do cyan
+                        draw_bar(&mut display, &arr, i, false);
+                    }
+                    // i == hi: pivot juz na miejscu, pomijamy
 
                     // dodaj podtablice na stos
-                    if i > lo && stack_top < 63 {
+                    if i > lo && stack_top < NUM_BARS - 1 {
                         stack[stack_top] = (lo, i - 1);
                         stack_top += 1;
                     }
-                    if i < hi && stack_top < 63 {
+                    if i < hi && stack_top < NUM_BARS - 1 {
                         stack[stack_top] = (i + 1, hi);
                         stack_top += 1;
                     }
                 }
 
-                if !interrupted {
+                if interrupted {
+                    // przycisk wcisniety — czekamy na zwolnienie + cooldown 300ms
+                    while btn.is_low() {
+                        delay.delay_millis(10);
+                    }
+                    delay.delay_millis(300);
+                    screen = Screen::Weather;
+                } else {
                     // sortowanie skonczone — pokaz posortowana tablice chwile, potem losuj od nowa
-                    display.clear();
-                    font.render_aligned(
-                        "Quick Sort",
-                        Point::new(0, 0),
-                        u8g2_fonts::types::VerticalPosition::Top,
-                        u8g2_fonts::types::HorizontalAlignment::Left,
-                        u8g2_fonts::types::FontColor::Transparent(BinaryColor::On),
-                        &mut display,
-                    ).ok();
-                    draw_bars(&mut display, &arr, 64, 64); // 64 = brak aktywnych
-                    display.flush().unwrap();
-                    delay.delay_millis(1000);
+                    draw_all_bars(&mut display, &arr);
+                    delay.delay_millis(500);
+                    for k in 0..NUM_BARS {
+                        let x = (k * (BAR_WIDTH + BAR_GAP)) as i32;
+                        let h = arr[k] as i32;
+                        let _ = Rectangle::new(
+                            Point::new(x, BAR_TOP),
+                            Size::new(BAR_WIDTH as u32, BAR_MAX_H as u32),
+                        )
+                        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                        .draw(&mut display);
+                        let _ = Rectangle::new(
+                            Point::new(x, BAR_BOTTOM - h),
+                            Size::new(BAR_WIDTH as u32, h as u32),
+                        )
+                        .into_styled(PrimitiveStyle::with_fill(Rgb565::new(0, 63, 0)))
+                        .draw(&mut display);
+                        delay.delay_millis(80);
+                    }
+                    delay.delay_millis(3000);
                 }
             }
         }
